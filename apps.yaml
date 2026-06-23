@@ -1,0 +1,14 @@
+# Prayer Times App / Demonstration of what app daemon should look like
+prayer_times:
+  module: prayer_times_homeassistant_used
+  class: PrayerTimes
+  city: "اربد"
+  scene_on: scene.prayer_on
+  scene_off: scene.prayer_off
+  before_minutes: 2
+  after_minutes: 6
+  test_mode: false
+  test_scene_on_in_seconds: 30
+  test_scene_off_after_on_seconds: 10
+  schedule_from_file_only: false
+
