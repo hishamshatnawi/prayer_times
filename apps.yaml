@@ -1,6 +1,6 @@
 # Prayer Times App / Demonstration of what app daemon should look like
 prayer_times:
-  module: prayer_times_homeassistant_used
+  module: prayer_times
   class: PrayerTimes
   city: "اربد"
   scene_on: scene.prayer_on

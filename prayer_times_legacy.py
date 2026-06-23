@@ -5,7 +5,6 @@ import argparse
 import json
 import re
 import sys
-import unicodedata
 from datetime import date, timedelta
 
 import requests
@@ -34,125 +33,8 @@ AJAX_HEADERS = {
     "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
 }
 
-PRAYER_CLOCK_KEYS = frozenset(
-    {"fajr", "sunrise", "dhuhr", "asr", "maghrib", "isha"}
-)
 
-_AFTERNOON_SALAH_NO_MARKER_PM = frozenset({"asr", "maghrib", "isha"})
-
-_PRAYER_CLOCK_CELL_RE = re.compile(r"(\d{1,2}):(\d{2})")
-
-
-def normalize_awqaf_prayer_clock(raw: str, english_key: str | None = None) -> str:
-    """Return 24-hour ``H:MM`` from an Awqaf table time cell.
-
-    Marker-based: ``صباح`` / ``مساء``, or lone trailing ``ص`` / ``م``.
-    Examples: ``7:13 مساءً`` → ``19:13``; ``4:40 صباحاً`` → ``4:40``.
-
-    Without markers: ``asr`` / ``maghrib`` / ``isha`` hours 1–11 get ``+12`` (site omits
-    ``مساء``). ``dhuhr``: hour ``1`` → ``+12`` (1 PM → 13:MM); ``11`` / ``12`` unchanged.
-    Hours 13+ are never shifted. ``fajr`` / ``sunrise``: no such heuristic.
-    """
-    text = (raw or "").strip()
-    if not text:
-        return ""
-
-    m = _PRAYER_CLOCK_CELL_RE.search(text)
-    if not m:
-        return text
-
-    h = int(m.group(1))
-    mi = int(m.group(2))
-    s = unicodedata.normalize("NFKC", text)
-
-    has_am = "صباح" in s
-    has_pm = "مساء" in s
-
-    if not has_am and not has_pm:
-        tail = s[m.end() :].strip()
-        if tail:
-            if re.fullmatch(r"\u0645[\s\u064b-\u0652\u061f.,،؟؛:]*", tail):
-                has_pm = True
-            elif re.fullmatch(r"\u0635[\s\u064b-\u0652\u061f.,،؟؛:]*", tail):
-                has_am = True
-
-    if has_am and has_pm:
-        pass
-    elif h >= 13:
-        pass
-    elif has_pm:
-        if 1 <= h <= 11:
-            h += 12
-    elif has_am:
-        if h == 12:
-            h = 0
-    elif english_key in _AFTERNOON_SALAH_NO_MARKER_PM and 1 <= h <= 11:
-        h += 12
-    elif english_key == "dhuhr" and h == 1:
-        h += 12
-
-    return f"{h}:{mi:02d}"
-
-
-def drop_company_post_string(raw_value: str, label_text: str) -> str | None:
-    """Option ``value`` to POST; ``EnableEventValidation`` rejects label text when values are numeric."""
-    v = (raw_value or "").strip()
-    t = (label_text or "").strip()
-    if t == "الرجاء الاختيار" or v == "الرجاء الاختيار":
-        return None
-    if not v and not t:
-        return None
-    if v == "0" and "اختيار" in t:
-        return None
-    return v or t
-
-
-def _collect_options_from_select(select) -> list[tuple[str, str, str]]:
-    out: list[tuple[str, str, str]] = []
-    if not select:
-        return out
-    for opt in select.find_all("option"):
-        raw_val = (opt.get("value") or "").strip()
-        label = opt.get_text(strip=True)
-        post = drop_company_post_string(raw_val, label)
-        if post is None:
-            continue
-        out.append((post, label or post, raw_val))
-    return out
-
-
-def find_drop_company_select(soup: BeautifulSoup):
-    sel = soup.find("select", id=re.compile(r"DropCompany", re.I))
-    if sel:
-        return sel
-    for candidate in soup.find_all("select"):
-        nm = candidate.get("name") or ""
-        idi = candidate.get("id") or ""
-        if "DropCompany" in nm or "DropCompany" in idi:
-            return candidate
-    return None
-
-
-def region_options_from_html(html_text: str) -> list[tuple[str, str, str]]:
-    soup = BeautifulSoup(html_text, "html.parser")
-    region_options = _collect_options_from_select(find_drop_company_select(soup))
-    if region_options:
-        return region_options
-    block = re.search(
-        r"<select[^>]*DropCompany[^>]*>.*?</select>",
-        html_text,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-    if block:
-        return _collect_options_from_select(
-            BeautifulSoup(block.group(0), "html.parser").find("select")
-        )
-    return []
-
-
-def get_session_and_viewstate(
-    session: requests.Session,
-) -> tuple[dict, list[tuple[str, str, str]]]:
+def get_session_and_viewstate(session: requests.Session) -> tuple[dict, list[str]]:
     """GET the page to obtain fresh viewstate, event validation, cookies, and city list."""
     resp = session.get(BASE_URL, headers={
         "User-Agent": HEADERS["User-Agent"],
@@ -173,9 +55,16 @@ def get_session_and_viewstate(
         if name and name not in fields:
             fields[name] = inp.get("value", "")
 
-    region_options = region_options_from_html(resp.text)
+    # Extract available cities from the dropdown
+    cities = []
+    select = soup.find("select", {"id": re.compile(r"DropCompany", re.I)})
+    if select:
+        for opt in select.find_all("option"):
+            val = opt.get("value", "")
+            if val and val != "الرجاء الاختيار":
+                cities.append(val)
 
-    return fields, region_options
+    return fields, cities
 
 
 def build_post_data(hidden_fields: dict, city: str, from_date: str, to_date: str) -> dict:
@@ -267,12 +156,7 @@ def parse_prayer_times(html: str) -> list[dict]:
             if idx < len(headers):
                 arabic_header = headers[idx]
                 english_key = column_map.get(arabic_header, arabic_header)
-                if english_key in PRAYER_CLOCK_KEYS:
-                    entry[english_key] = normalize_awqaf_prayer_clock(
-                        cell_value, english_key
-                    )
-                else:
-                    entry[english_key] = cell_value.strip()
+                entry[english_key] = cell_value
             else:
                 entry[f"col_{idx}"] = cell_value
 
@@ -281,67 +165,43 @@ def parse_prayer_times(html: str) -> list[dict]:
     return results
 
 
-def resolve_drop_company(
-    city: str, region_options: list[tuple[str, str, str]]
-) -> tuple[str, str]:
-    """Return (DropCompany POST string, display label)."""
-    if not region_options:
-        print(
-            "Warning: No DropCompany options in HTML. "
-            "POSTing --city as given; use a numeric region id from the site if this fails.",
-            file=sys.stderr,
-        )
-        return city, city
-
-    for post, label, raw in region_options:
-        if city == post or city == label:
-            return post, label
-        if raw.isdigit() and city == raw:
-            return post, label
-
-    matches = [
-        (post, label)
-        for post, label, raw in region_options
-        if city in post or city in label
-    ]
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) > 1:
-        print(f"Error: '{city}' matches multiple regions:", file=sys.stderr)
-        for _, lbl in matches:
-            print(f"  - {lbl}", file=sys.stderr)
-        sys.exit(1)
-
-    print(
-        f"Error: City '{city}' not found. Use --list-cities. "
-        f"Sample: {[(p, l) for p, l, _ in region_options[:5]]}",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
-
 def fetch_prayer_times(
     from_date: str, to_date: str, city: str = "اربد", list_cities: bool = False
-) -> tuple[list[dict], str]:
-    """Fetch and return (parsed rows, resolved region label). ``list_cities`` → ``([], \"\")``."""
+) -> list[dict]:
+    """Main function: fetch and return parsed prayer times."""
     session = requests.Session()
 
     print("Initializing session and fetching viewstate...")
-    hidden_fields, region_options = get_session_and_viewstate(session)
+    hidden_fields, available_cities = get_session_and_viewstate(session)
     print(f"Session established. Cookies: {list(session.cookies.keys())}")
 
     if list_cities:
-        print("\nAvailable cities/regions (label / numeric value_attr / POST field):")
-        for post, label, raw in region_options:
-            print(f"  - {label}  |  value={raw!r}  →  POST DropCompany={post!r}")
-        return [], ""
+        print("\nAvailable cities/regions:")
+        for c in available_cities:
+            print(f"  - {c}")
+        return []
 
-    post_company, display_label = resolve_drop_company(city, region_options)
+    if available_cities and city not in available_cities:
+        # Try partial match (e.g., "عمان" matches "عمان، البلقاء، الزرقاء، مادبا")
+        matches = [c for c in available_cities if city in c]
+        if len(matches) == 1:
+            print(f"City '{city}' matched to '{matches[0]}'")
+            city = matches[0]
+        elif len(matches) > 1:
+            print(f"Error: '{city}' matches multiple regions:", file=sys.stderr)
+            for m in matches:
+                print(f"  - {m}", file=sys.stderr)
+            print("Please specify the full region name.", file=sys.stderr)
+            sys.exit(1)
+        else:
+            print(f"Error: City '{city}' not found. Use --list-cities to see options.",
+                  file=sys.stderr)
+            sys.exit(1)
 
-    post_data = build_post_data(hidden_fields, post_company, from_date, to_date)
+    post_data = build_post_data(hidden_fields, city, from_date, to_date)
 
     headers = {**HEADERS, **AJAX_HEADERS}
-    print(f"Fetching prayer times for {display_label} from {from_date} to {to_date}...")
+    print(f"Fetching prayer times for {city} from {from_date} to {to_date}...")
     resp = session.post(BASE_URL, data=post_data, headers=headers)
     resp.raise_for_status()
 
@@ -354,7 +214,7 @@ def fetch_prayer_times(
         print("Response preview (first 2000 chars):", file=sys.stderr)
         print(resp.text[:2000], file=sys.stderr)
 
-    return prayer_times, display_label
+    return prayer_times
 
 
 def validate_date(date_str: str) -> str:
@@ -398,7 +258,7 @@ def main():
     )
     parser.add_argument(
         "--output",
-        default="/config/appdaemon/apps/prayer_times.json",
+        default="prayer_times.json",
         help="Output JSON file path (default: prayer_times.json)",
     )
     parser.add_argument(
@@ -409,7 +269,7 @@ def main():
 
     args = parser.parse_args()
 
-    prayer_times, resolved_city = fetch_prayer_times(
+    prayer_times = fetch_prayer_times(
         args.from_date, args.to_date, args.city, args.list_cities
     )
 
@@ -417,7 +277,7 @@ def main():
         return
 
     output = {
-        "city": resolved_city,
+        "city": args.city,
         "from_date": args.from_date,
         "to_date": args.to_date,
         "count": len(prayer_times),
