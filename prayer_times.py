@@ -10,7 +10,8 @@ Configure in ``/config/appdaemon/apps/apps.yaml`` (UTF-8)::
       scene_off: scene.prayer_off
       pre_fajr_minutes: 15
       before_minutes: 2
-      after_minutes: 6
+      after_minutes: 5
+      fajr_after_minutes: 6
       test_mode: false
       test_scene_on_in_seconds: 30
       test_scene_off_after_on_seconds: 10
@@ -36,9 +37,13 @@ and reschedule (file is never overwritten). Use for hand-edited JSON tests; disa
 then ``scene_off``. ``test_scene_on_in_seconds`` (default ``90``); ``test_scene_off_after_on_seconds``
 (default ``10``) is seconds after ``scene_on`` until ``scene_off``. Turn ``test_mode`` off after verifying.
 
+``after_minutes`` (default ``5``): minutes after each non-Fajr anchor (and pre-Fajr) until
+``scene_off``. ``fajr_after_minutes`` (default ``6``): same for Fajr only. ``before_minutes``
+is shared by all windows.
+
 ``pre_fajr_minutes`` (default ``0``): when positive, adds an extra window anchored at Fajr minus
-that many minutes (same ``before_minutes`` / ``after_minutes`` as other prayers). Use ``15`` for
-a typical tahajjud / imsak-style lead; ``0`` disables.
+that many minutes (same ``before_minutes`` / ``after_minutes`` as other non-Fajr prayers). Use
+``15`` for a typical tahajjud / imsak-style lead; ``0`` disables.
 
 If you omit ``city``, default is Irbid via Unicode escapes (ASCII-safe ``.py`` file).
 """
@@ -359,7 +364,8 @@ class PrayerTimes(hass.Hass):
         self.scene_on = (self.args.get("scene_on") or "scene.prayer_on").strip()
         self.scene_off = (self.args.get("scene_off") or "scene.prayer_off").strip()
         self.before_minutes = int(self.args.get("before_minutes", 2))
-        self.after_minutes = int(self.args.get("after_minutes", 6))
+        self.after_minutes = int(self.args.get("after_minutes", 5))
+        self.fajr_after_minutes = int(self.args.get("fajr_after_minutes", 6))
         pk = self.args.get("prayer_keys")
         self.prayer_keys = pk if isinstance(pk, list) else list(DEFAULT_PRAYER_KEYS)
         self._switch_handles = []
@@ -373,6 +379,12 @@ class PrayerTimes(hass.Hass):
         self.log("PrayerTimes app started")
         self.run_in(self.update_prayer_times, 5, trigger="startup")
         self.run_daily(self.update_prayer_times, "00:05:00")
+
+    def _after_minutes_for(self, prayer_key):
+        """Minutes after the anchor until ``scene_off``; Fajr can differ from other prayers."""
+        if prayer_key == "fajr":
+            return self.fajr_after_minutes
+        return self.after_minutes
 
     def update_prayer_times(self, kwargs=None):
         if kwargs is None:
@@ -560,8 +572,9 @@ class PrayerTimes(hass.Hass):
                 if prayer_dt is None:
                     continue
 
+                after = self._after_minutes_for(key)
                 on_dt = prayer_dt - timedelta(minutes=self.before_minutes)
-                off_dt = prayer_dt + timedelta(minutes=self.after_minutes)
+                off_dt = prayer_dt + timedelta(minutes=after)
                 lbl = PRAYER_LOG_LABELS.get(key, key)
                 scheduled += self._schedule_scene_window(
                     on_dt, off_dt, now, lbl, warn_label=key
@@ -600,7 +613,8 @@ class PrayerTimes(hass.Hass):
         )
         self.log(
             f"Scenes {self.scene_on!r} / {self.scene_off!r}: {scheduled} timer(s) for "
-            f"{self.before_minutes} min before / {self.after_minutes} min after anchor "
+            f"{self.before_minutes} min before / "
+            f"{self.after_minutes} min after (Fajr {self.fajr_after_minutes} min) "
             f"({', '.join(self.prayer_keys)}){extra}",
         )
 
