@@ -377,6 +377,16 @@ class PrayerTimes(hass.Hass):
         )
         self.pre_fajr_minutes = int(self.args.get("pre_fajr_minutes", 0))
         self.log("PrayerTimes app started")
+        if self.pre_fajr_minutes > 0:
+            self.log(
+                f"pre_fajr_minutes={self.pre_fajr_minutes} "
+                "(extra window before Fajr enabled)"
+            )
+        else:
+            self.log(
+                "pre_fajr_minutes=0; extra Pre-Fajr window is disabled",
+                level="WARNING",
+            )
         self.run_in(self.update_prayer_times, 5, trigger="startup")
         self.run_daily(self.update_prayer_times, "00:05:00")
 

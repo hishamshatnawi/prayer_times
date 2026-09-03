@@ -5,6 +5,7 @@ prayer_times:
   city: "اربد"
   scene_on: scene.prayer_on
   scene_off: scene.prayer_off
+  pre_fajr_minutes: 15
   before_minutes: 2
   after_minutes: 5
   fajr_after_minutes: 6
