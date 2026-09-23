@@ -235,13 +235,64 @@ def extract_html_from_ajax(response_text: str) -> str:
     return response_text
 
 
+def ajax_error_message(response_text: str) -> str | None:
+    """Return ASP.NET AJAX ``error`` payload text, or ``None`` if not an error frame."""
+    parts = (response_text or "").split("|")
+    i = 0
+    while i < len(parts) - 3:
+        try:
+            int(parts[i])
+        except ValueError:
+            i += 1
+            continue
+        if parts[i + 1] == "error":
+            return parts[i + 3]
+        i += 4
+    if "DataBinding:" in (response_text or "") and "Fajr" in (response_text or ""):
+        return response_text[:300]
+    return None
+
+
+_PRAYER_DATE_RE = re.compile(r"^\d{1,2}/\d{1,2}/\d{4}$")
+
+
+def column_key_for_header(arabic_header: str) -> str:
+    column_map = {
+        "اليوم": "day",
+        "التاريخ": "date",
+        "الفجر": "fajr",
+        "الشروق": "sunrise",
+        "الظهر": "dhuhr",
+        "العصر": "asr",
+        "المغرب": "maghrib",
+        "العشاء": "isha",
+    }
+    return column_map.get(arabic_header, arabic_header)
+
+
+def _is_prayer_data_row(cells: list[str], headers_txt: list[str]) -> bool:
+    """True when the row has a DD/MM/YYYY date (skips GridView pager chrome)."""
+    if not cells or len(cells) < 2:
+        return False
+    date_idx = None
+    for idx, header in enumerate(headers_txt):
+        if header == "التاريخ" or column_key_for_header(header) == "date":
+            date_idx = idx
+            break
+    if date_idx is None:
+        date_idx = 0
+    if date_idx >= len(cells):
+        return False
+    return bool(_PRAYER_DATE_RE.match(cells[date_idx].strip()))
+
+
 def parse_prayer_times(html: str) -> list[dict]:
     """Parse the prayer times table from the HTML response."""
     soup = BeautifulSoup(html, "html.parser")
 
     # Look for the results table/grid
     table = (
-        soup.find("table", {"id": re.compile(r"grd_Result|GridView", re.I)})
+        soup.find("table", {"id": re.compile(r"gvWebparts|grd_Result|GridView", re.I)})
         or soup.find("table", class_=re.compile(r"grid|table|result", re.I))
         or soup.find("table")
     )
@@ -257,29 +308,19 @@ def parse_prayer_times(html: str) -> list[dict]:
     header_row = rows[0]
     headers = [th.get_text(strip=True) for th in header_row.find_all(["th", "td"])]
 
-    # Known column mapping (Arabic -> English)
-    column_map = {
-        "اليوم": "day",
-        "التاريخ": "date",
-        "الفجر": "fajr",
-        "الشروق": "sunrise",
-        "الظهر": "dhuhr",
-        "العصر": "asr",
-        "المغرب": "maghrib",
-        "العشاء": "isha",
-    }
-
     results = []
     for row in rows[1:]:
-        cells = [td.get_text(strip=True) for td in row.find_all("td")]
-        if not cells or len(cells) < 2:
+        cells = [
+            td.get_text(strip=True)
+            for td in row.find_all("td", recursive=False)
+        ]
+        if not _is_prayer_data_row(cells, headers):
             continue
 
         entry = {}
         for idx, cell_value in enumerate(cells):
             if idx < len(headers):
-                arabic_header = headers[idx]
-                english_key = column_map.get(arabic_header, arabic_header)
+                english_key = column_key_for_header(headers[idx])
                 if english_key in PRAYER_CLOCK_KEYS:
                     entry[english_key] = normalize_awqaf_prayer_clock(
                         cell_value, english_key
@@ -333,6 +374,23 @@ def resolve_drop_company(
     sys.exit(1)
 
 
+def _post_search(
+    session: requests.Session,
+    hidden_fields: dict,
+    post_company: str,
+    from_date: str,
+    to_date: str,
+) -> tuple[str, str | None]:
+    post_data = build_post_data(hidden_fields, post_company, from_date, to_date)
+    headers = {**HEADERS, **AJAX_HEADERS}
+    resp = session.post(BASE_URL, data=post_data, headers=headers)
+    resp.raise_for_status()
+    err = ajax_error_message(resp.text)
+    if err:
+        return "", err
+    return extract_html_from_ajax(resp.text), None
+
+
 def fetch_prayer_times(
     from_date: str, to_date: str, city: str = "اربد", list_cities: bool = False
 ) -> tuple[list[dict], str]:
@@ -351,21 +409,30 @@ def fetch_prayer_times(
 
     post_company, display_label = resolve_drop_company(city, region_options)
 
-    post_data = build_post_data(hidden_fields, post_company, from_date, to_date)
-
-    headers = {**HEADERS, **AJAX_HEADERS}
     print(f"Fetching prayer times for {display_label} from {from_date} to {to_date}...")
-    resp = session.post(BASE_URL, data=post_data, headers=headers)
-    resp.raise_for_status()
+    html_content, err = _post_search(
+        session, hidden_fields, post_company, from_date, to_date
+    )
+    if err:
+        # Awqaf dated search currently 500s (DataBinding 'Fajr'). Empty dates
+        # still return the site's default ~11-day city table.
+        print(
+            f"Warning: Awqaf dated search failed ({err[:160]}); "
+            "retrying with empty dates (site default range).",
+            file=sys.stderr,
+        )
+        hidden_fields, _ = get_session_and_viewstate(session)
+        html_content, err = _post_search(
+            session, hidden_fields, post_company, "", ""
+        )
 
-    html_content = extract_html_from_ajax(resp.text)
-    prayer_times = parse_prayer_times(html_content)
+    prayer_times = parse_prayer_times(html_content) if html_content else []
 
     if not prayer_times:
         print("Warning: No prayer times found in response. The page structure may have changed.",
               file=sys.stderr)
         print("Response preview (first 2000 chars):", file=sys.stderr)
-        print(resp.text[:2000], file=sys.stderr)
+        print((err or html_content or "")[:2000], file=sys.stderr)
 
     return prayer_times, display_label
 
@@ -429,10 +496,17 @@ def main():
     if args.list_cities:
         return
 
+    meta_from = args.from_date
+    meta_to = args.to_date
+    if prayer_times:
+        dates = [r.get("date") for r in prayer_times if r.get("date")]
+        if dates:
+            meta_from, meta_to = dates[0], dates[-1]
+
     output = {
         "city": resolved_city,
-        "from_date": args.from_date,
-        "to_date": args.to_date,
+        "from_date": meta_from,
+        "to_date": meta_to,
         "count": len(prayer_times),
         "prayer_times": prayer_times,
     }
