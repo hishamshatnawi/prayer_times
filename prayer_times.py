@@ -541,6 +541,7 @@ class PrayerTimes(hass.Hass):
                 )
                 cached = self._load_cached_prayer_file()
                 if not cached or not cached.get("prayer_times"):
+                    self._cancel_switch_schedules()
                     self._alert_fetch_issue(
                         "hard",
                         f"No usable data in {PRAYER_TIMES_PATH} (file-only mode).",
@@ -585,6 +586,7 @@ class PrayerTimes(hass.Hass):
                         reason = "fetch returned no rows (empty response)"
                     cached = self._load_cached_prayer_file()
                     if not cached or not cached.get("prayer_times"):
+                        self._cancel_switch_schedules()
                         self._alert_fetch_issue(
                             "hard",
                             f"No prayer times available ({reason}; no usable cached file).",
@@ -602,6 +604,7 @@ class PrayerTimes(hass.Hass):
                 self._schedule_test_mode_once()
 
         except Exception as e:
+            self._cancel_switch_schedules()
             self._alert_fetch_issue("hard", f"Error updating prayer times: {e}")
 
     def _load_cached_prayer_file(self):
