@@ -16,6 +16,8 @@ Configure in ``/config/appdaemon/apps/apps.yaml`` (UTF-8)::
       test_scene_on_in_seconds: 30
       test_scene_off_after_on_seconds: 10
       schedule_from_file_only: false
+      notify_service: notify.mobile_app_CHANGE_ME
+      notify_on_soft_failure: true
 
 ``city``: Arabic label, numeric DropCompany id (e.g. ``2`` for Irbid), or a substring of the region name.
 
@@ -29,6 +31,17 @@ Optional ``prayer_keys`` list overrides which columns drive the schedule.
 
 If the live fetch fails or returns no rows, the app reuses ``/config/appdaemon/apps/prayer_times.json``
 when it still contains valid data.
+
+``notify_service``: Home Assistant notify target for push alerts (e.g. ``notify.mobile_app_phone``).
+Accepts ``notify.xxx`` or ``notify/xxx``. When set, fetch issues also call that service. When empty
+or omitted, only a persistent notification is created. Find your service under Developer Tools →
+Services → ``notify.*``.
+
+``notify_on_soft_failure`` (default ``true``): when true, alert if live fetch fails/empty but cache
+is used; hard failures (no usable data) always alert. Soft alerts can be disabled without code changes.
+
+On soft/hard fetch issues the app creates persistent notification ``prayer_times_fetch`` (and push
+if ``notify_service`` is set). A successful live fetch dismisses that notification.
 
 ``schedule_from_file_only`` (default ``false``): skip Awqaf fetch; load ONLY from ``prayer_times.json``
 and reschedule (file is never overwritten). Use for hand-edited JSON tests; disable for production.
@@ -83,6 +96,9 @@ AJAX_HEADERS = {
 }
 
 PRAYER_TIMES_PATH = "/config/appdaemon/apps/prayer_times.json"
+
+FETCH_ALERT_NOTIFICATION_ID = "prayer_times_fetch"
+FETCH_ALERT_TITLE = "Prayer times"
 
 DEFAULT_PRAYER_KEYS = ["fajr", "dhuhr", "asr", "maghrib", "isha"]
 
@@ -399,6 +415,21 @@ def _yaml_bool(value, default=False):
     return bool(value)
 
 
+def normalize_notify_service(raw):
+    """Return AppDaemon ``domain/service`` form, or ``None`` if unset/placeholder."""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s or "CHANGE_ME" in s:
+        return None
+    if "/" in s:
+        return s
+    if "." in s:
+        domain, _, service = s.partition(".")
+        return f"{domain}/{service}"
+    return f"notify/{s}"
+
+
 class PrayerTimes(hass.Hass):
 
     def initialize(self):
@@ -419,6 +450,10 @@ class PrayerTimes(hass.Hass):
             self.args.get("test_scene_off_after_on_seconds", 10)
         )
         self.pre_fajr_minutes = int(self.args.get("pre_fajr_minutes", 0))
+        self.notify_service = normalize_notify_service(self.args.get("notify_service"))
+        self.notify_on_soft_failure = _yaml_bool(
+            self.args.get("notify_on_soft_failure"), default=True
+        )
         self.log("PrayerTimes app started")
         if self.pre_fajr_minutes > 0:
             self.log(
@@ -430,6 +465,14 @@ class PrayerTimes(hass.Hass):
                 "pre_fajr_minutes=0; extra Pre-Fajr window is disabled",
                 level="WARNING",
             )
+        if self.notify_service:
+            self.log(f"Fetch alerts: persistent + push via {self.notify_service}")
+        else:
+            self.log(
+                "Fetch alerts: persistent notification only "
+                "(set notify_service in apps.yaml for push)",
+                level="WARNING",
+            )
         self.run_in(self.update_prayer_times, 5, trigger="startup")
         self.run_daily(self.update_prayer_times, "00:05:00")
 
@@ -438,6 +481,42 @@ class PrayerTimes(hass.Hass):
         if prayer_key == "fajr":
             return self.fajr_after_minutes
         return self.after_minutes
+
+    def _alert_fetch_issue(self, level, message):
+        """Notify HA on soft (cache fallback) or hard (no data) fetch problems."""
+        if level == "soft" and not self.notify_on_soft_failure:
+            self.log(message, level="WARNING")
+            return
+        log_level = "ERROR" if level == "hard" else "WARNING"
+        self.log(message, level=log_level)
+        try:
+            self.call_service(
+                "persistent_notification/create",
+                notification_id=FETCH_ALERT_NOTIFICATION_ID,
+                title=FETCH_ALERT_TITLE,
+                message=message,
+            )
+        except Exception as e:
+            self.log(f"persistent_notification.create failed: {e}", level="ERROR")
+        if self.notify_service:
+            try:
+                self.call_service(
+                    self.notify_service,
+                    title=FETCH_ALERT_TITLE,
+                    message=message,
+                )
+            except Exception as e:
+                self.log(f"notify via {self.notify_service} failed: {e}", level="ERROR")
+
+    def _clear_fetch_alert(self):
+        """Dismiss the fetch-issue persistent notification after a successful live fetch."""
+        try:
+            self.call_service(
+                "persistent_notification/dismiss",
+                notification_id=FETCH_ALERT_NOTIFICATION_ID,
+            )
+        except Exception as e:
+            self.log(f"persistent_notification.dismiss failed: {e}", level="WARNING")
 
     def update_prayer_times(self, kwargs=None):
         if kwargs is None:
@@ -454,20 +533,22 @@ class PrayerTimes(hass.Hass):
                 )
                 cached = self._load_cached_prayer_file()
                 if not cached or not cached.get("prayer_times"):
-                    self.log(
+                    self._alert_fetch_issue(
+                        "hard",
                         f"No usable data in {PRAYER_TIMES_PATH} (file-only mode).",
-                        level="ERROR",
                     )
                     return
                 prayer_data = cached["prayer_times"]
             else:
                 fresh = None
                 region_used = self.city
+                fetch_reason = None
                 try:
                     fresh, region_used = self.fetch_prayer_times(
                         from_date, to_date, self.city
                     )
                 except Exception as e:
+                    fetch_reason = str(e)
                     self.log(f"Fetch failed: {e}", level="WARNING")
                     fresh = None
 
@@ -487,20 +568,23 @@ class PrayerTimes(hass.Hass):
                     with open(PRAYER_TIMES_PATH, "w", encoding="utf-8") as f:
                         json.dump(output, f, ensure_ascii=False, indent=2)
                     self.log(f"Saved {len(fresh)} entries to {PRAYER_TIMES_PATH}")
+                    self._clear_fetch_alert()
                     prayer_data = fresh
                 else:
+                    if fetch_reason:
+                        reason = f"fetch failed: {fetch_reason}"
+                    else:
+                        reason = "fetch returned no rows (empty response)"
                     cached = self._load_cached_prayer_file()
                     if not cached or not cached.get("prayer_times"):
-                        self.log(
-                            "No prayer times available (fetch failed or empty, "
-                            "and no usable cached file).",
-                            level="ERROR",
+                        self._alert_fetch_issue(
+                            "hard",
+                            f"No prayer times available ({reason}; no usable cached file).",
                         )
                         return
-                    self.log(
-                        "Using cached prayer times from "
-                        f"{PRAYER_TIMES_PATH} (fetch failed or returned no rows).",
-                        level="WARNING",
+                    self._alert_fetch_issue(
+                        "soft",
+                        f"Using cached prayer times from {PRAYER_TIMES_PATH} ({reason}).",
                     )
                     prayer_data = cached["prayer_times"]
 
@@ -510,7 +594,7 @@ class PrayerTimes(hass.Hass):
                 self._schedule_test_mode_once()
 
         except Exception as e:
-            self.log(f"Error: {e}", level="ERROR")
+            self._alert_fetch_issue("hard", f"Error updating prayer times: {e}")
 
     def _load_cached_prayer_file(self):
         try:
