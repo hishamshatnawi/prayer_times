@@ -500,10 +500,18 @@ class PrayerTimes(hass.Hass):
             self.log(f"persistent_notification.create failed: {e}", level="ERROR")
         if self.notify_service:
             try:
+                # ttl/priority help Companion deliver while the phone is dozing (Android FCM).
                 self.call_service(
                     self.notify_service,
                     title=FETCH_ALERT_TITLE,
                     message=message,
+                    data={
+                        "ttl": 0,
+                        "priority": "high",
+                        "channel": "prayer_times",
+                        "importance": "high",
+                        "push": {"sound": "default", "interruption-level": "time-sensitive"},
+                    },
                 )
             except Exception as e:
                 self.log(f"notify via {self.notify_service} failed: {e}", level="ERROR")
@@ -533,6 +541,7 @@ class PrayerTimes(hass.Hass):
                 )
                 cached = self._load_cached_prayer_file()
                 if not cached or not cached.get("prayer_times"):
+                    self._cancel_switch_schedules()
                     self._alert_fetch_issue(
                         "hard",
                         f"No usable data in {PRAYER_TIMES_PATH} (file-only mode).",
@@ -577,6 +586,7 @@ class PrayerTimes(hass.Hass):
                         reason = "fetch returned no rows (empty response)"
                     cached = self._load_cached_prayer_file()
                     if not cached or not cached.get("prayer_times"):
+                        self._cancel_switch_schedules()
                         self._alert_fetch_issue(
                             "hard",
                             f"No prayer times available ({reason}; no usable cached file).",
@@ -594,6 +604,7 @@ class PrayerTimes(hass.Hass):
                 self._schedule_test_mode_once()
 
         except Exception as e:
+            self._cancel_switch_schedules()
             self._alert_fetch_issue("hard", f"Error updating prayer times: {e}")
 
     def _load_cached_prayer_file(self):
