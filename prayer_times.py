@@ -500,10 +500,18 @@ class PrayerTimes(hass.Hass):
             self.log(f"persistent_notification.create failed: {e}", level="ERROR")
         if self.notify_service:
             try:
+                # ttl/priority help Companion deliver while the phone is dozing (Android FCM).
                 self.call_service(
                     self.notify_service,
                     title=FETCH_ALERT_TITLE,
                     message=message,
+                    data={
+                        "ttl": 0,
+                        "priority": "high",
+                        "channel": "prayer_times",
+                        "importance": "high",
+                        "push": {"sound": "default", "interruption-level": "time-sensitive"},
+                    },
                 )
             except Exception as e:
                 self.log(f"notify via {self.notify_service} failed: {e}", level="ERROR")
