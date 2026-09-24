@@ -741,12 +741,13 @@ class PrayerTimes(hass.Hass):
             return [], city
 
         merged_headers = {**HEADERS, **AJAX_HEADERS}
+        # Prefer dated search so it works again when Awqaf fixes their API.
+        # Today dated search 500s (DataBinding 'Fajr'); empty dates still return
+        # the site's default ~10-day city table.
         html_content, err = self._post_search(
             session, hidden_fields, post_company, from_date, to_date, merged_headers
         )
         if err:
-            # Awqaf dated search currently 500s (DataBinding 'Fajr'). Empty dates
-            # still return the site's default ~11-day city table.
             self.log(
                 f"Awqaf dated search failed ({err[:160]}); "
                 "retrying with empty dates (site default range).",
@@ -769,10 +770,12 @@ class PrayerTimes(hass.Hass):
     def _post_search(session, hidden_fields, post_company, from_date, to_date, headers):
         post_data = build_post_data(hidden_fields, post_company, from_date, to_date)
         resp = session.post(BASE_URL, data=post_data, headers=headers)
-        resp.raise_for_status()
+        # HTTP 500 can still carry an ASP.NET AJAX error frame (e.g. DataBinding/Fajr);
+        # inspect that before raise_for_status so callers can retry empty dates.
         err = ajax_error_message(resp.text)
         if err:
             return "", err
+        resp.raise_for_status()
         return extract_html_from_ajax(resp.text), None
 
     def _resolve_drop_company(self, city, region_options):
