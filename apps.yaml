@@ -13,4 +13,7 @@ prayer_times:
   test_scene_on_in_seconds: 30
   test_scene_off_after_on_seconds: 10
   schedule_from_file_only: false
+  # Developer Tools → Services → notify.* (e.g. notify.mobile_app_your_phone)
+  notify_service: notify.mobile_app_CHANGE_ME
+  notify_on_soft_failure: true
 

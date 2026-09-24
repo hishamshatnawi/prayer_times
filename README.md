@@ -24,8 +24,8 @@ Both `prayer_times_cli.py` and `prayer_times.py` share the same Awqaf scraping c
 | **Scene automation** | No | Yes — `scene_on` / `scene_off` around each prayer |
 | **Scheduling** | One-shot when you run it | Startup + daily at 00:05 |
 | **Config** | CLI flags (`--city`, `--output`, …) | `apps.yaml` (`before_minutes`, `test_mode`, …) |
-| **On fetch failure** | Prints warning; may write empty JSON | Falls back to cached `prayer_times.json` |
-| **Extra features** | `--list-cities` | `pre_fajr_minutes`, `test_mode`, `schedule_from_file_only`, `prayer_keys` |
+| **On fetch failure** | Prints warning; may write empty JSON | Falls back to cached `prayer_times.json`; alerts via persistent notification (+ optional push) |
+| **Extra features** | `--list-cities` | `pre_fajr_minutes`, `test_mode`, `schedule_from_file_only`, `prayer_keys`, `notify_service` |
 
 **Use the CLI** to list regions, debug scraping, or generate JSON offline.
 
@@ -57,7 +57,22 @@ Default output path matches the AppDaemon cache: `/config/appdaemon/apps/prayer_
 3. Create Home Assistant scenes `scene.prayer_on` and `scene.prayer_off` (or change the names in config).
 4. Restart AppDaemon.
 
-See the module docstring in `prayer_times.py` for all configuration options (`test_mode`, `pre_fajr_minutes`, `schedule_from_file_only`, etc.).
+### Fetch failure alerts
+
+When the Awqaf live fetch fails or returns no rows:
+
+- **Soft:** cache is used — persistent notification (and push if configured). Controllable with `notify_on_soft_failure` (default `true`).
+- **Hard:** no usable cache — always alerts; scenes are not scheduled.
+
+Set `notify_service` to your mobile (or other) notify target so you get a push as well as the in-app persistent notification:
+
+1. In Home Assistant: **Developer Tools → Services**, search `notify.` and pick your device (e.g. `notify.mobile_app_pixel`).
+2. In `apps.yaml`, set `notify_service: notify.mobile_app_pixel` (dot or slash form both work).
+3. Restart AppDaemon.
+
+If `notify_service` is omitted or left as the `CHANGE_ME` placeholder, only the persistent notification (`prayer_times_fetch`) is created. A successful live fetch dismisses that notification.
+
+See the module docstring in `prayer_times.py` for all configuration options (`test_mode`, `pre_fajr_minutes`, `schedule_from_file_only`, `notify_service`, etc.).
 
 ## License
 
