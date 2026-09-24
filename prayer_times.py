@@ -237,6 +237,57 @@ def extract_html_from_ajax(response_text):
     return response_text
 
 
+def ajax_error_message(response_text):
+    """Return ASP.NET AJAX ``error`` payload text, or ``None`` if not an error frame."""
+    parts = (response_text or "").split("|")
+    i = 0
+    while i < len(parts) - 3:
+        try:
+            int(parts[i])
+        except ValueError:
+            i += 1
+            continue
+        if parts[i + 1] == "error":
+            return parts[i + 3]
+        i += 4
+    if "DataBinding:" in (response_text or "") and "Fajr" in (response_text or ""):
+        return response_text[:300]
+    return None
+
+
+_PRAYER_DATE_RE = re.compile(r"^\d{1,2}/\d{1,2}/\d{4}$")
+
+
+def _is_prayer_data_row(cells, headers_txt):
+    """True when the row has a DD/MM/YYYY date (skips GridView pager chrome)."""
+    if not cells or len(cells) < 2:
+        return False
+    date_idx = None
+    for idx, header in enumerate(headers_txt):
+        if header == "التاريخ" or column_key_for_header(header) == "date":
+            date_idx = idx
+            break
+    if date_idx is None:
+        date_idx = 0
+    if date_idx >= len(cells):
+        return False
+    return bool(_PRAYER_DATE_RE.match(cells[date_idx].strip()))
+
+
+def column_key_for_header(arabic_header):
+    column_map = {
+        "اليوم": "day",
+        "التاريخ": "date",
+        "الفجر": "fajr",
+        "الشروق": "sunrise",
+        "الظهر": "dhuhr",
+        "العصر": "asr",
+        "المغرب": "maghrib",
+        "العشاء": "isha",
+    }
+    return column_map.get(arabic_header, arabic_header)
+
+
 def normalize_awqaf_prayer_clock(raw, english_key=None):
     """Return 24-hour ``H:MM`` from an Awqaf table time cell.
 
@@ -292,7 +343,7 @@ def normalize_awqaf_prayer_clock(raw, english_key=None):
 def parse_prayer_times(html):
     soup = BeautifulSoup(html, "html.parser")
     table = (
-        soup.find("table", {"id": re.compile(r"grd_Result|GridView", re.I)})
+        soup.find("table", {"id": re.compile(r"gvWebparts|grd_Result|GridView", re.I)})
         or soup.find("table", class_=re.compile(r"grid|table|result", re.I))
         or soup.find("table")
     )
@@ -308,28 +359,20 @@ def parse_prayer_times(html):
         th.get_text(strip=True) for th in header_row.find_all(["th", "td"])
     ]
 
-    column_map = {
-        "اليوم": "day",
-        "التاريخ": "date",
-        "الفجر": "fajr",
-        "الشروق": "sunrise",
-        "الظهر": "dhuhr",
-        "العصر": "asr",
-        "المغرب": "maghrib",
-        "العشاء": "isha",
-    }
-
     results = []
     for row in rows[1:]:
-        cells = [td.get_text(strip=True) for td in row.find_all("td")]
-        if not cells or len(cells) < 2:
+        # Nested pager tables produce extra <td>s; use only direct children.
+        cells = [
+            td.get_text(strip=True)
+            for td in row.find_all("td", recursive=False)
+        ]
+        if not _is_prayer_data_row(cells, headers_txt):
             continue
 
         entry = {}
         for idx, cell_value in enumerate(cells):
             if idx < len(headers_txt):
-                arabic_header = headers_txt[idx]
-                english_key = column_map.get(arabic_header, arabic_header)
+                english_key = column_key_for_header(headers_txt[idx])
                 if english_key in PRAYER_CLOCK_KEYS:
                     entry[english_key] = normalize_awqaf_prayer_clock(
                         cell_value, english_key
@@ -429,10 +472,14 @@ class PrayerTimes(hass.Hass):
                     fresh = None
 
                 if fresh:
+                    meta_from, meta_to = from_date, to_date
+                    dates = [r.get("date") for r in fresh if r.get("date")]
+                    if dates:
+                        meta_from, meta_to = dates[0], dates[-1]
                     output = {
                         "city": region_used,
-                        "from_date": from_date,
-                        "to_date": to_date,
+                        "from_date": meta_from,
+                        "to_date": meta_to,
                         "count": len(fresh),
                         "prayer_times": fresh,
                     }
@@ -693,19 +740,43 @@ class PrayerTimes(hass.Hass):
         if post_company is None:
             return [], city
 
-        post_data = build_post_data(hidden_fields, post_company, from_date, to_date)
         merged_headers = {**HEADERS, **AJAX_HEADERS}
-        resp = session.post(BASE_URL, data=post_data, headers=merged_headers)
-        resp.raise_for_status()
+        # Prefer dated search so it works again when Awqaf fixes their API.
+        # Today dated search 500s (DataBinding 'Fajr'); empty dates still return
+        # the site's default ~10-day city table.
+        html_content, err = self._post_search(
+            session, hidden_fields, post_company, from_date, to_date, merged_headers
+        )
+        if err:
+            self.log(
+                f"Awqaf dated search failed ({err[:160]}); "
+                "retrying with empty dates (site default range).",
+                level="WARNING",
+            )
+            hidden_fields, _ = get_session_and_viewstate(session)
+            html_content, err = self._post_search(
+                session, hidden_fields, post_company, "", "", merged_headers
+            )
 
-        html_content = extract_html_from_ajax(resp.text)
-        prayer_times = parse_prayer_times(html_content)
+        prayer_times = parse_prayer_times(html_content) if html_content else []
 
         if not prayer_times:
-            preview = resp.text[:2000].replace("\n", " ")
+            preview = (err or html_content or "")[:2000].replace("\n", " ")
             self.log(f"No prayer times parsed. Response preview: {preview}", level="WARNING")
 
         return prayer_times, display_name
+
+    @staticmethod
+    def _post_search(session, hidden_fields, post_company, from_date, to_date, headers):
+        post_data = build_post_data(hidden_fields, post_company, from_date, to_date)
+        resp = session.post(BASE_URL, data=post_data, headers=headers)
+        # HTTP 500 can still carry an ASP.NET AJAX error frame (e.g. DataBinding/Fajr);
+        # inspect that before raise_for_status so callers can retry empty dates.
+        err = ajax_error_message(resp.text)
+        if err:
+            return "", err
+        resp.raise_for_status()
+        return extract_html_from_ajax(resp.text), None
 
     def _resolve_drop_company(self, city, region_options):
         """Map user ``city`` to DropCompany POST string (Awqaf-compatible)."""
