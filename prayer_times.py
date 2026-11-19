@@ -66,6 +66,7 @@ import os
 import re
 import unicodedata
 from datetime import date, datetime, timedelta
+from urllib.parse import unquote
 from zoneinfo import ZoneInfo
 
 import appdaemon.plugins.hass.hassapi as hass
@@ -78,6 +79,8 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0",
     "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9,ar-JO;q=0.8",
+    # Avoid brotli: urllib3 may advertise ``br`` when brotli is installed, but
+    # decoding can fail and corrupt ASP.NET AJAX frames (pageRedirect missed).
     "Accept-Encoding": "gzip, deflate",
     "Origin": "https://www.awqaf.gov.jo",
     "Referer": BASE_URL,
@@ -254,8 +257,9 @@ def extract_html_from_ajax(response_text):
 
 
 def ajax_error_message(response_text):
-    """Return ASP.NET AJAX ``error`` payload text, or ``None`` if not an error frame."""
-    parts = (response_text or "").split("|")
+    """Return ASP.NET AJAX ``error``/``pageRedirect`` payload text, or ``None``."""
+    text = response_text or ""
+    parts = text.split("|")
     i = 0
     while i < len(parts) - 3:
         try:
@@ -263,11 +267,21 @@ def ajax_error_message(response_text):
         except ValueError:
             i += 1
             continue
-        if parts[i + 1] == "error":
+        part_type = parts[i + 1]
+        if part_type == "error":
             return parts[i + 3]
+        if part_type == "pageRedirect":
+            # e.g. %2fErrorPages%2fError404.html%3faspxerrorpath%3d%2far%2fPages%2fPrayerTime
+            path = unquote(parts[i + 3] or "").strip()
+            return f"pageRedirect:{path}" if path else "pageRedirect"
         i += 4
-    if "DataBinding:" in (response_text or "") and "Fajr" in (response_text or ""):
-        return response_text[:300]
+    # Corrupted encodings can break pipe framing; still detect redirect/error markers.
+    if "pageRedirect" in text:
+        m = re.search(r"pageRedirect\|+([^|]*)", text)
+        path = unquote((m.group(1) if m else "") or "").strip()
+        return f"pageRedirect:{path}" if path else "pageRedirect"
+    if "DataBinding:" in text and "Fajr" in text:
+        return text[:300]
     return None
 
 
@@ -837,14 +851,17 @@ class PrayerTimes(hass.Hass):
 
         merged_headers = {**HEADERS, **AJAX_HEADERS}
         # Prefer dated search so it works again when Awqaf fixes their API.
-        # Today dated search 500s (DataBinding 'Fajr'); empty dates still return
-        # the site's default ~10-day city table.
+        # Today dated search returns AJAX pageRedirect to Error404 (or older
+        # DataBinding/Fajr 500s); empty dates still return the site's default
+        # ~10-day city table.
         html_content, err = self._post_search(
             session, hidden_fields, post_company, from_date, to_date, merged_headers
         )
-        if err:
+        prayer_times = parse_prayer_times(html_content) if html_content else []
+        if err or not prayer_times:
+            reason = err or "dated search returned no parseable rows"
             self.log(
-                f"Awqaf dated search failed ({err[:160]}); "
+                f"Awqaf dated search failed ({reason[:160]}); "
                 "retrying with empty dates (site default range).",
                 level="WARNING",
             )
@@ -852,8 +869,7 @@ class PrayerTimes(hass.Hass):
             html_content, err = self._post_search(
                 session, hidden_fields, post_company, "", "", merged_headers
             )
-
-        prayer_times = parse_prayer_times(html_content) if html_content else []
+            prayer_times = parse_prayer_times(html_content) if html_content else []
 
         if not prayer_times:
             preview = (err or html_content or "")[:2000].replace("\n", " ")
@@ -865,8 +881,8 @@ class PrayerTimes(hass.Hass):
     def _post_search(session, hidden_fields, post_company, from_date, to_date, headers):
         post_data = build_post_data(hidden_fields, post_company, from_date, to_date)
         resp = session.post(BASE_URL, data=post_data, headers=headers)
-        # HTTP 500 can still carry an ASP.NET AJAX error frame (e.g. DataBinding/Fajr);
-        # inspect that before raise_for_status so callers can retry empty dates.
+        # AJAX error / pageRedirect frames can arrive with HTTP 200; inspect
+        # before raise_for_status so callers can retry empty dates.
         err = ajax_error_message(resp.text)
         if err:
             return "", err
